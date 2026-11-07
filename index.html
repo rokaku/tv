@@ -19,7 +19,7 @@
         .container { max-width: 960px; margin: 0 auto; }
 
         h1 { font-size: 1.5rem; margin-bottom: 4px; }
-        .hint { font-size: 0.85rem; color: #57606a; margin-bottom: 14px; }
+        .hint { font-size: 0.85rem; color: #57606a; margin-bottom: 14px; }        
 
         .player {
             position: relative;
@@ -32,6 +32,8 @@
         }
 
         .player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+        .player > div { position: absolute; inset: 0; }
+
         .now { margin: 12px 0; font-size: 0.9rem; color: #57606a; }
         .now strong { color: #1f2328; }
 
@@ -53,6 +55,8 @@
 
         .channels .num { color: #57606a; margin-right: 6px; font-size: 0.78rem; }
 
+        .now select { margin-left: 8px; padding: 2px 6px; font-size: 0.85rem; font-family: inherit; border: 1px solid #dde2ea; border-radius: 6px; background: #fff; color: #1f2328; }
+
         .note { margin-top: 18px; font-size: 0.8rem; color: #57606a; }
     </style>
 </head>
@@ -60,18 +64,29 @@
 <div class="container">
     <h1>Live TV</h1>
     <p class="hint">
-        <strong>↑ ↓</strong> 切台 · <strong>數字</strong> 跳台 · <strong>Backspace</strong> 上一台 · <strong>F</strong> 全螢幕。
+        <strong>↑ ↓</strong> 切台 · <strong>數字</strong> 跳台 · <strong>Backspace</strong> 上一台 · <strong>← →</strong> 音量 · <strong>M</strong> 靜音 · <strong>F</strong> 全螢幕。
     </p>
 
-    <div class="player"><iframe id="yt-player" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></div>
-    <div class="now">目前頻道：<strong id="now">—</strong></div>
+    <div class="player"><div id="yt-player"></div></div>
+    <div class="now">目前頻道：<strong id="now">—</strong> <span id="vol"></span>
+        <label>解析度：<select id="quality">
+            <option value="default">自動</option>
+            <option value="tiny">144P</option>
+            <option value="small">240P</option>
+            <option value="medium">360P</option>
+            <option value="large">480P</option>
+            <option value="hd720">720P</option>
+            <option value="hd1080">1080P</option>
+        </select></label>
+    </div>
     <div class="channels" id="channels"></div>
 
     <p class="note">畫面來自各電視台的 YouTube 官方直播；若某頻道無法播放，可能是對方關閉了嵌入或目前未開播。</p>
 </div>
 <script>
+    // https://developers.google.com/youtube/iframe_api_reference
     // 頻道清單：id 是 YouTube「直播影片 ID」（watch?v= 後面 11 碼）。
-    // 取得方式：開啟該台 YouTube 直播頁，複製網址 v= 後面的字串。    
+    // 取得方式：開啟該台 YouTube 直播頁，複製網址 v= 後面的字串。
     // 注意：有些台每次開播影片 ID 會變，失效時需要更新。
     // num 是本頁自訂的序號（用來鍵盤輸入跳台），不是電視實際頻道號碼。
     const CHANNELS = [
@@ -91,11 +106,35 @@
     ];
 
     const nowEl = document.getElementById('now');
+    const volEl = document.getElementById('vol');
+    const qualityEl = document.getElementById('quality');
     const list = document.getElementById('channels');
     const playerBox = document.querySelector('.player');
-    const frame = document.getElementById('yt-player');
     let current = 0;
     let previous = -1;   // 上一台，供 Backspace 返回
+    let player = null;   // YT.Player，載入完成前為 null
+    let pending = null;  // 播放器還沒好時先記下要播的頻道
+
+    function showVolume() {
+        if (!player || !player.getVolume) return;
+        volEl.textContent = player.isMuted() ? '🔇 靜音' : '🔊 ' + player.getVolume() + '%';
+    }
+
+    // 套用畫質（YouTube 對此 API 屬盡力而為，實際檔位仍可能被調整）
+    function applyQuality() {
+        if (!player || !player.setPlaybackQuality) return;
+        const q = qualityEl.value;
+        if (player.setPlaybackQualityRange && q !== 'default') player.setPlaybackQualityRange(q, q);
+        player.setPlaybackQuality(q);
+    }
+
+    qualityEl.value = localStorage.getItem('livetv-quality') || 'default';
+    if (qualityEl.selectedIndex < 0) qualityEl.value = 'default';
+    qualityEl.addEventListener('change', () => {
+        localStorage.setItem('livetv-quality', qualityEl.value);
+        applyQuality();
+        qualityEl.blur();  // 避免方向鍵被選單吃掉
+    });
 
     function play(i, remember = true) {
         const next = (i + CHANNELS.length) % CHANNELS.length;
@@ -105,7 +144,52 @@
         nowEl.textContent = c.num + '  ' + c.title;
         list.querySelectorAll('button').forEach((b, k) => b.setAttribute('aria-pressed', String(k === current)));
         localStorage.setItem('livetv-last', String(c.num));
-        frame.src = 'https://www.youtube.com/embed/' + c.id + '?autoplay=1&rel=0&playsinline=1';
+        if (player && player.loadVideoById) {
+            const q = qualityEl.value;
+            player.loadVideoById(q === 'default' ? { videoId: c.id } : { videoId: c.id, suggestedQuality: q });
+        }
+        else pending = c.id;
+    }
+
+    // YouTube IFrame Player API（音量控制必須透過它）
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+
+    window.onYouTubeIframeAPIReady = function () {
+        player = new YT.Player('yt-player', {
+            width: '100%',
+            height: '100%',
+            videoId: pending || CHANNELS[current].id,
+            playerVars: { autoplay: 1, rel: 0, playsinline: 1, fs: 1 },
+            events: {
+                onReady: () => {
+                    const saved = parseInt(localStorage.getItem('livetv-vol'), 10);
+                    if (!isNaN(saved)) player.setVolume(saved);
+                    showVolume();
+                    applyQuality();
+                },
+                onStateChange: e => {
+                    showVolume();
+                    if (e.data === YT.PlayerState.PLAYING) applyQuality();
+                }
+            }
+        });
+    };
+
+    function changeVolume(delta) {
+        if (!player || !player.setVolume) return;
+        if (player.isMuted()) player.unMute();
+        const v = Math.max(0, Math.min(100, player.getVolume() + delta));
+        player.setVolume(v);
+        localStorage.setItem('livetv-vol', String(v));
+        showVolume();
+    }
+
+    function toggleMute() {
+        if (!player || !player.isMuted) return;
+        player.isMuted() ? player.unMute() : player.mute();
+        showVolume();
     }
 
     function toggleFullscreen() {
@@ -125,13 +209,16 @@
         list.appendChild(b);
     });
 
-    // 鍵盤：↑↓ 切台、數字跳台、Backspace 上一台、F 全螢幕
+    // 鍵盤：↑↓ 切台、數字跳台、Backspace 上一台、←→ 音量、M 靜音、F 全螢幕
     let buffer = '', timer;
     document.addEventListener('keydown', e => {
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (e.key === 'ArrowUp') { e.preventDefault(); play(current - 1); }
         else if (e.key === 'ArrowDown') { e.preventDefault(); play(current + 1); }
+        else if (e.key === 'ArrowLeft') { e.preventDefault(); changeVolume(-10); }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); changeVolume(10); }
         else if (e.key === 'Backspace') { e.preventDefault(); if (previous >= 0) play(previous); }
+        else if (e.key === 'm' || e.key === 'M') toggleMute();
         else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
         else if (/^[0-9]$/.test(e.key)) {
             buffer += e.key;
